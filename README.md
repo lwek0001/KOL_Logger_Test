@@ -9,6 +9,8 @@
 * Display data on a screen (ili9341)
 * Store data in SD card
 * Obtain real current readings
+* Design Printed Circuit Board
+* Test Printed Circuit Board
 
 ## Configure the project (just wifi settings)
 
