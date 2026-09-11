@@ -1,6 +1,13 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+
 #include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -11,6 +18,34 @@
 #include "lwip/sys.h"
 
 #include "esp_http_server.h"
+
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_ili9341.h"
+
+#include "driver/spi_master.h"
+#include "esp_netif.h"
+
+// using ESP32-S3 SPI2 hardware peripheral to control the LCD
+#define LCD_HOST SPI2_HOST
+#define LCD_PIXEL_CLOCK_HZ (10 * 1000 * 1000)
+
+// GPIO
+#define PIN_NUM_MOSI GPIO_NUM_11
+#define PIN_NUM_SCLK GPIO_NUM_12
+#define PIN_NUM_CS   GPIO_NUM_10
+#define PIN_NUM_DC   GPIO_NUM_9
+#define PIN_NUM_RST  GPIO_NUM_14
+
+// native resolution of the ILI9341 LCD
+#define LCD_H_RES 240
+#define LCD_V_RES 320
+
+// graph dimensions
+#define GRAPH_X 20
+#define GRAPH_Y 20
+#define GRAPH_W 200
+#define GRAPH_H 250
 
 // configuration macros for WiFi settings, defined in project configuration
 #define ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID // preprocessor macro for WiFi SSID from project configuration, associate ESP_WIFI_SSID with CONFIG_ESP_WIFI_SSID
@@ -24,22 +59,197 @@
 #define GTK_REKEY_INTERVAL 0
 #endif
 
-// initialise fake measurements for testing
-static float current = 123.0f;
+static float samples[GRAPH_W];
+static int sample_count = 0;
 
+// initialise fake measurements for testing
+static float current = 100.0f;
+// pointer to queue used by scheduler to hold the fake measurements (this is equivalent to static struct QueueDefinition* measurement_queue)
+static QueueHandle_t measurement_queue;
+
+// for logging
+static const char *TAG1 = "LCD";
 static const char *TAG = "wifi softAP";
+
+// this array stores the image that is sent to the LCD. Each pixel is represented by a 16-bit value in RGB565 format.
+static uint16_t frame_buffer[LCD_H_RES * LCD_V_RES];
+
+// lcd uses 16-bit in RGB565 format colour, however, the ESP32-S3 is little-endian, so we need to swap the byte order of each pixel before sending it to the LCD
+static uint16_t rgb565_be(uint16_t colour)
+{
+    // from GCC built-in function to swap the byte order of a 16-bit value
+    return __builtin_bswap16(colour);
+}
 
 // freeRTOS task to simulate changing measurements
 static void fake_measurement_task(void *pvParameters)
 {
+    // avoid compiler warning about unused parameter
+    (void)pvParameters;
     while (1)
     {
+        // generate one measurement per second
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
         current -= 1.0f;
         if (current < 0.0f) {
             current = 100.0f;
         }
+        // send the current measurement to the graph task via the queue (will only contain the latest measurement)
+        xQueueOverwrite(measurement_queue, &current);
+        
+    }
+}
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+// add a new measurement to the samples array, shifting the existing measurements to the left if the array is full
+static void add_sample(float value)
+{
+    if (sample_count < GRAPH_W) {
+        // graph is not full yet
+        samples[sample_count] = value;
+        sample_count++;
+    } else {
+        // graph is full, so shift every measurement one position to the left
+        for (int i=0; i < GRAPH_W-1; i++) {
+            samples[i] = samples[i+1];
+        }
+        samples[GRAPH_W-1] = value;
+    }
+}
+
+// convert measurement value (0-100) to a y coord
+static int value_to_y(float value)
+{
+    // limit the value to the range 0-100
+    if (value < 0.0f) {
+        value = 0.0f;
+    } else if (value > 100.0f) {
+        value = 100.0f;
+    }
+    // convert 100 -> top of graph, 0 -> bottom of graph
+    float normalized = value / 100.0f;
+    int y = GRAPH_Y + (GRAPH_H - 1) - (int)(normalized * (GRAPH_H - 1));
+    return y;
+}
+
+// draw one pixel into the frame buffer at the given x,y coordinates with the given colour
+static void draw_pixel(int x, int y, uint16_t colour)
+{
+    // check that the coordinates are inside the LCD bounds
+    if (x < 0 || x >= LCD_H_RES || y < 0 || y >= LCD_V_RES) 
+    {
+        return;
+    }
+    // update the frame buffer with the new pixel colour with converted x, y coordinates
+    frame_buffer[y * LCD_H_RES + x] = colour;
+}
+
+// draw line between two points using Bresenham's line algorithm
+static void draw_line(int x0, int y0, int x1, int y1, uint16_t colour)
+{
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    while (1) {
+        draw_pixel(x0, y0, colour);
+
+        if (x0 == x1 && y0 == y1) 
+        {
+            // reached the end point, so exit the loop
+            break;
+        }
+
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+// draw the whole graph for every sample...
+static void draw_graph(struct esp_lcd_panel_t *panel_handle)
+{
+  // RGB565 colour values for the graph
+  uint16_t black = rgb565_be(0x0000); // black
+  uint16_t white = rgb565_be(0xFFFF); // white  
+  uint16_t green = rgb565_be(0x07E0); // green
+
+  // clear the entire frame buffer to black
+  for (int i=0; i < LCD_V_RES*LCD_H_RES; i++)
+  {
+    frame_buffer[i] = black;
+  }
+
+  // coordinates of the graph boundries
+  int graph_left = GRAPH_X;
+  int graph_right = GRAPH_X + GRAPH_W - 1;
+  int graph_top = GRAPH_Y;
+  int graph_bottom = GRAPH_Y + GRAPH_H - 1;
+
+  // draw Y axis
+  draw_line(graph_left, graph_top, graph_left, graph_bottom, white);
+  // draw X axis
+  draw_line(graph_left, graph_bottom, graph_right, graph_bottom, white);
+
+  // draw time ticks every 10 pixels (1 pixel = 1 second)
+  for (int x=graph_left; x <= graph_right; x += 10) 
+  {
+      draw_line(x, graph_bottom, x, graph_bottom - 5, white);
+  }
+
+  for (int i=1; i < sample_count; i++)
+  {
+    // previous measuremnt
+    int x0 = GRAPH_X + i - 1;
+    int y0 = value_to_y(samples[i - 1]);
+
+    // current measurement
+    int x1 = GRAPH_X + i;
+    int y1 = value_to_y(samples[i]);
+
+    // draw line between the two measurements
+    draw_line(x0, y0, x1, y1, green);   
+  }
+
+  // send completed frame buffer to the LCD
+  ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(
+      panel_handle,
+      0,              // starting x coordinate
+      0,              // starting y coordinate
+      LCD_H_RES,      // ending x coordinate (not included)
+      LCD_V_RES,      // ending y coordinate (not included)
+      frame_buffer // send the frame buffer to the LCD
+  ));
+}
+
+// graph task
+static void graph_task(void *pvParameters)
+{
+    // app main will pas the panel handle to this task via pvParameters
+    struct esp_lcd_panel_t *panel_handle = (struct esp_lcd_panel_t *)pvParameters; // typcast
+    
+    float new_measurement;
+
+    while (1)
+    {
+        // wait for a new measurement to be available in the queue
+        if (xQueueReceive(measurement_queue, &new_measurement, portMAX_DELAY) == pdTRUE)
+        {
+            // store new measurement in the sample array
+            add_sample(new_measurement);
+            ESP_LOGI(TAG1, "New measurement: %.1f", new_measurement);
+
+            // redraw the graph with the new sample
+            draw_graph(panel_handle);
+        }
     }
 }
 
@@ -275,10 +485,110 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // configure the SPI bus
+    ESP_LOGI(TAG1, "Configuring SPI bus");
+    // use ESP32 default SPI bus configuration
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = PIN_NUM_MOSI, // ESP32 sends data to the LCD via this pin from the ESP32's MOSI pin to the LCD's SDI pin
+        .miso_io_num = -1, // not using anything from the LCD, so no need for MISO pin
+        .sclk_io_num = PIN_NUM_SCLK, // ESP32 provides clock signal to the LCD, via this pin to the LCD's SCLK pin
+
+        // using normal SPI mode, so no need for WP and HD pins
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+
+        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t), // maximum transfer size possible in bytes
+    };
+    /*initialize the ESP32-S3 SPI bus (SPI2), using above configuration, and let the driver choose a DMA channel automatically
+    DMA is a hardwired feature of the ESP32 that allows it to transfer data from RAM to a peripheral, in this case this SPI bus, without constant involvement of the CPU
+    CPU only needs to be involved when initiating a transfer and when the transfer is complete.
+    This is much faster than the CPU doing it, and allows the CPU to do other things while the transfer is happening. */
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
+    
+
+    // create the LCD panel SPI communication interface
+    ESP_LOGI(TAG1, "Creating LCD SPI Interface");
+    /* define a pointer to a LCD panel IO object, 
+    initially we point it to NULL, but it will be redefined later with esp_lcd_new_panel_io_spi() to create the LCD panel SPI interface
+    The I/O object reporesnts the communication interface between the ESP32 and the LCD */
+    struct esp_lcd_panel_io_t *io_handle = NULL; 
+    // use ESP32 LCD SPI IO configuration structure to define how the LCD communicates with the SPI(2) bus
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = PIN_NUM_DC, // ESP32 sends data/command signal to the LCD via this pin from the ESP32's GPIO pin to the LCD's D/C pin
+        .cs_gpio_num = PIN_NUM_CS, // ESP32 selects the LCD via this pin from the ESP32's GPIO pin to the LCD's CS pin
+        .pclk_hz = LCD_PIXEL_CLOCK_HZ, // SPI clock frequency used when communicating with the LCD
+        .lcd_cmd_bits = 8, // number of bits in a command
+        .lcd_param_bits = 8, // number of bits in a parameter
+        .spi_mode = 0, // SPI mode 0
+        .trans_queue_depth = 10, // transaction, allows up to 10 transactions to be queued at once to wait
+    };
+    // finally create the LCD panel SPI interface using the defined configuration io_config, and provide a handle io_handle, and check for errors
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
+        (esp_lcd_spi_bus_handle_t)LCD_HOST, 
+        &io_config, 
+        &io_handle // This handle now contains a pointer to the LCD panel I/O object
+    ));
+
+
+    // create ILI9341 LCD paneL driver
+    ESP_LOGI(TAG1, "Creating ILI9341 LCD panel driver");
+    /* define a pointer to a LCD panel object, 
+    initially we point it to NULL, but it will be redefined later with esp_lcd_new_panel_ili9341() to create tje ILI9341 LCD panel driver
+    The panel object represents the actual LCD controller/driver */
+    struct esp_lcd_panel_t *panel_handle = NULL; 
+    // use ESP32 LCD panel device configuration structure to define characteristics of the ILI9341 LCD panel
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = PIN_NUM_RST, // ESP32 resets the LCD via this pin from the ESP32's GPIO pin to the LCD's RESET pin
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB, // colour component order, we are using R - G- B order
+        .bits_per_pixel = 16, // number of bits per pixel used by the LCD
+    };
+    // finally create the ILI9341 LCD panel driver using the defined LCD panel I/O SPI interface, configuration panel_config, and provide a handle panel_handle, and check for errors
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(
+        io_handle, 
+        &panel_config, 
+        &panel_handle // This handle now contains a pointer to the ILI9341 LCD panel object
+    ));
+
+
+    // reset the LCD
+    ESP_LOGI(TAG1, "Resetting LCD");
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+
+
+    // initialize ILI9341
+    ESP_LOGI(TAG1, "Initializing LCD");
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    // turn the display on
+    ESP_LOGI(TAG1, "Turning on LCD");
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+    // create a queue to hold the latest measurement, with a length of 1 (only the latest measurement is needed)
+    measurement_queue = xQueueCreate(1, sizeof(float));
+
+    if (measurement_queue == NULL) {
+        ESP_LOGE(TAG1, "Failed to create measurement queue");
+        return;
+    }
+
+    // create empty graph with no samples
+    draw_graph(panel_handle);
+
+
     ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
     wifi_init_softap();
 
     start_webserver();
+
+    // graph task
+    xTaskCreate(
+    graph_task,             // task function
+    "graph",                // task name
+    4096,                   // stack size
+    panel_handle,           // parameters passed to task (pass the LCD panel handle so the graph task can draw to the LCD)
+    5,                      // task priority
+    NULL                    // task handle
+    );
 
     xTaskCreate(
     fake_measurement_task,  // task function
@@ -288,4 +598,6 @@ void app_main(void)
     5,                      // task priority    
     NULL                    // task handle
     );
+
+    ESP_LOGI(TAG1, "Done!");
 }
