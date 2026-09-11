@@ -3,7 +3,7 @@
 * ESP32 acts as a wifi access point (AP)
 * Task that creates dummy current (A) data
 * ESP32 hosts dynamic website displaying dummy current (A) data
-* LCD screen (ili9341) displays a rough graph using SPI
+* LCD screen (ili9341) displays a rough dynamic graph of the dummy current data using SPI
 
 ## TO-DO
 * Polish graph display on LCD screen
