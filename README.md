@@ -3,10 +3,10 @@
 * ESP32 acts as a wifi access point (AP)
 * Task that creates dummy current (A) data
 * ESP32 hosts dynamic website displaying dummy current (A) data
+* LCD screen (ili9341) displays a rough graph using SPI
 
 ## TO-DO
-* Display data as a graph
-* Display data on a screen (ili9341)
+* Polish graph display on LCD screen
 * Store data in SD card
 * Obtain real current readings
 * Design Printed Circuit Board
@@ -22,5 +22,4 @@ In the `Example Configuration` menu:
     * Set `WiFi SSID`.
     * Set `WiFi Password`.
 
-## Built from ESP32 softap wifi example
 
