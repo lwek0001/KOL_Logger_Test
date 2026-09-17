@@ -1,3 +1,3 @@
 idf_component_register(SRCS "kol_logger_test_main.c"
-                    PRIV_REQUIRES esp_wifi nvs_flash esp_http_server
+                    PRIV_REQUIRES esp_wifi nvs_flash esp_http_server esp_timer
                     INCLUDE_DIRS ".")

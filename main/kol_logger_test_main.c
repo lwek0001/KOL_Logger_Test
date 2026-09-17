@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "esp_mac.h"
 #include "esp_wifi.h"
@@ -25,6 +26,8 @@
 
 #include "driver/spi_master.h"
 #include "esp_netif.h"
+
+#include "esp_timer.h"
 
 // using ESP32-S3 SPI2 hardware peripheral to control the LCD
 #define LCD_HOST SPI2_HOST
@@ -59,13 +62,25 @@
 #define GTK_REKEY_INTERVAL 0
 #endif
 
-static float samples[GRAPH_W];
-static int sample_count = 0;
-
 // initialise fake measurements for testing
-static float current = 100.0f;
+typedef struct {
+    float current; // current draw in mA
+    int64_t timestamp_ms; // timestamp in milli seconds since the start of the program
+} measurement_t;
+
+static measurement_t latest_measurement = {
+    .current = 100.0f,
+    .timestamp_ms = 0
+};
+
+static SemaphoreHandle_t measurement_mutex; // mutex to protect access to latest_measurement
+
 // pointer to queue used by scheduler to hold the fake measurements (this is equivalent to static struct QueueDefinition* measurement_queue)
 static QueueHandle_t measurement_queue;
+
+static measurement_t samples[GRAPH_W];
+static int sample_count = 0;
+
 
 // for logging
 static const char *TAG1 = "LCD";
@@ -91,29 +106,36 @@ static void fake_measurement_task(void *pvParameters)
         // generate one measurement per second
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        current -= 1.0f;
-        if (current < 0.0f) {
-            current = 100.0f;
+        // guarentee queue gets consistent current value and timestamp
+        if (xSemaphoreTake(measurement_mutex, portMAX_DELAY)==pdTRUE)
+        {
+            latest_measurement.current -= 1.0f;
+            if (latest_measurement.current < 0.0f) {
+                latest_measurement.current = 100.0f;
+            }
+            latest_measurement.timestamp_ms = esp_timer_get_time() / 1000; // time in milliseconds since the start of the program
+
+            // send the current measurement to the graph task via the queue (will only contain the latest measurement)
+            xQueueOverwrite(measurement_queue, &latest_measurement);
+
+            xSemaphoreGive(measurement_mutex);
         }
-        // send the current measurement to the graph task via the queue (will only contain the latest measurement)
-        xQueueOverwrite(measurement_queue, &current);
-        
     }
 }
 
 // add a new measurement to the samples array, shifting the existing measurements to the left if the array is full
-static void add_sample(float value)
+static void add_sample(const measurement_t *value)
 {
     if (sample_count < GRAPH_W) {
         // graph is not full yet
-        samples[sample_count] = value;
+        samples[sample_count] = *value;
         sample_count++;
     } else {
         // graph is full, so shift every measurement one position to the left
         for (int i=0; i < GRAPH_W-1; i++) {
             samples[i] = samples[i+1];
         }
-        samples[GRAPH_W-1] = value;
+        samples[GRAPH_W-1] = *value;
     }
 }
 
@@ -205,18 +227,23 @@ static void draw_graph(struct esp_lcd_panel_t *panel_handle)
       draw_line(x, graph_bottom, x, graph_bottom - 5, white);
   }
 
-  for (int i=1; i < sample_count; i++)
+  if (sample_count >= 2) 
   {
-    // previous measuremnt
-    int x0 = GRAPH_X + i - 1;
-    int y0 = value_to_y(samples[i - 1]);
+    int64_t start_time = samples[0].timestamp_ms;
 
-    // current measurement
-    int x1 = GRAPH_X + i;
-    int y1 = value_to_y(samples[i]);
+    for (int i=1; i < sample_count; i++)
+    {
+        // previous measuremnt
+        int x0 = GRAPH_X + (samples[i - 1].timestamp_ms - start_time) / 1000; // convert milliseconds to seconds
+        int y0 = value_to_y(samples[i - 1].current);
 
-    // draw line between the two measurements
-    draw_line(x0, y0, x1, y1, green);   
+        // current measurement
+        int x1 = GRAPH_X + (samples[i].timestamp_ms - start_time) / 1000; // convert milliseconds to seconds
+        int y1 = value_to_y(samples[i].current);
+
+        // draw line between the two measurements
+        draw_line(x0, y0, x1, y1, green);   
+    }
   }
 
   // send completed frame buffer to the LCD
@@ -236,7 +263,7 @@ static void graph_task(void *pvParameters)
     // app main will pas the panel handle to this task via pvParameters
     struct esp_lcd_panel_t *panel_handle = (struct esp_lcd_panel_t *)pvParameters; // typcast
     
-    float new_measurement;
+    measurement_t new_measurement;
 
     while (1)
     {
@@ -244,8 +271,8 @@ static void graph_task(void *pvParameters)
         if (xQueueReceive(measurement_queue, &new_measurement, portMAX_DELAY) == pdTRUE)
         {
             // store new measurement in the sample array
-            add_sample(new_measurement);
-            ESP_LOGI(TAG1, "New measurement: %.1f", new_measurement);
+            add_sample(&new_measurement);
+            ESP_LOGI(TAG1, "Time: %lld ms, Current: %.1f mA", new_measurement.timestamp_ms, new_measurement.current);
 
             // redraw the graph with the new sample
             draw_graph(panel_handle);
@@ -257,14 +284,23 @@ static void graph_task(void *pvParameters)
 // runs whenever someone's browser requests /data (current draw)
 static esp_err_t data_get_handler(httpd_req_t *req)
 {
-    // 100 character buffer to hold response
-    char response[100];
+    // buffer to hold JSON response
+    char response[128];
+
+    measurement_t latest_measurement_copy = {0}; // initialise snapshot of latest measurement to zero
+
+    if (xSemaphoreTake(measurement_mutex, portMAX_DELAY)==pdTRUE)
+    {
+        // copy the latest measurement to a function local variable
+        latest_measurement_copy = latest_measurement;
+        xSemaphoreGive(measurement_mutex);
+    }
 
     // format response as JSON with current value
     snprintf(response,
              sizeof(response),
-             "{\"current\":%.1f}",
-             current);
+             "{\"current\":%.1f,\"timestamp\":%lld}",
+             latest_measurement_copy.current, latest_measurement_copy.timestamp_ms);
     
     // set response type to JSON 
     httpd_resp_set_type(req, "application/json");
@@ -323,6 +359,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
         "<h2>Current Draw</h2>"
         "<div class=\"value\" id=\"current\">-- mA</div>"
+        "<div class=\"value\" id=\"timestamp\">Time: -- ms</div>"
 
         "</div>"
 
@@ -335,6 +372,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
         "    document.getElementById('current').textContent = "
         "        data.current.toFixed(1) + ' mA';"
+
+        "    document.getElementById('timestamp').textContent = "
+        "        'Time: ' + data.timestamp + ' ms';"
 
         "}"
 
@@ -554,26 +594,32 @@ void app_main(void)
     ESP_LOGI(TAG1, "Resetting LCD");
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
 
-
     // initialize ILI9341
     ESP_LOGI(TAG1, "Initializing LCD");
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
 
     // turn the display on
     ESP_LOGI(TAG1, "Turning on LCD");
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
     // create a queue to hold the latest measurement, with a length of 1 (only the latest measurement is needed)
-    measurement_queue = xQueueCreate(1, sizeof(float));
-
+    measurement_queue = xQueueCreate(1, sizeof(measurement_t));
     if (measurement_queue == NULL) {
         ESP_LOGE(TAG1, "Failed to create measurement queue");
         return;
     }
 
+    // create a mutex to protect access to latest_measurement
+    measurement_mutex = xSemaphoreCreateMutex();
+    if (measurement_mutex == NULL) {
+        ESP_LOGE(TAG1, "Failed to create measurement mutex");
+        return;
+    }
+
     // create empty graph with no samples
     draw_graph(panel_handle);
-
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
     wifi_init_softap();
