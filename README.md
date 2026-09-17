@@ -2,7 +2,9 @@
 ## Current Functionality
 * ESP32 acts as a wifi access point (AP)
 * ESP32 hosts dynamic website displaying dummy current (A) data
-* LCD screen (ili9341) displays a rough dynamic graph of the dummy current data using SPI
+* LCD screen (ili9341) displays a rough dynamic graph of the measurement data using SPI
+* fake measurement data has timestamps from when ESP32 boots up
+* mutex protection for measurement data
 
 ## TO-DO
 * Polish graph display on LCD screen
