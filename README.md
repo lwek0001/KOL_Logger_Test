@@ -6,7 +6,7 @@
 * measurement data has timestamps from when ESP32 boots up
 * mutex protection for measurement data
 * Designed Logger Printed Circuit Board
-  ![PCB 3D View](Printed Circuit Board.png)
+  ![PCB 3D View](Printed Circuit Board img.png)
 
 ## TO-DO
 * Polish graph display on LCD screen
