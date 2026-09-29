@@ -5,7 +5,7 @@
 * LCD screen (ili9341) displays a rough dynamic graph of the measurement data using SPI
 * measurement data has timestamps from when ESP32 boots up
 * mutex protection for measurement data
-* Designed Logger Printed Circuit Board
+* Designed Logger Printed Circuit Board (still WIP)
   ![PCB 3D View](PCB_img.png)
 
 ## TO-DO
