@@ -1,19 +1,25 @@
 
-## Current Functionality
+## Currently Done
 * ESP32 acts as a wifi access point (AP)
 * ESP32 hosts dynamic website displaying measurement data - the current (mA) and associated timestamp 
 * LCD screen (ili9341) displays a rough dynamic graph of the measurement data using SPI
 * measurement data has timestamps from when ESP32 boots up
 * mutex protection for measurement data
+* Designed Logger Printed Circuit Board
+  ![PCB 3D View](Printed Circuit Board.png)
 
 ## TO-DO
 * Polish graph display on LCD screen
 * Store data in SD card
 * Obtain real current readings. Currently using dynamically changing current (mA) for testing purposes
-* Design Printed Circuit Board
+* Polish Logger Printed Circuit Board
+* Design Measurement Printed Circuit Board
 * Test Printed Circuit Board
 
-## Configure the project (just wifi settings)
+
+
+
+## Configure the project (wifi settings)
 
 Open the project configuration menu (`idf.py menuconfig`).
 
